@@ -21,10 +21,11 @@ jobs:
       - name: Install deps
         run: npm i
 
-      - name: Install Playwright Chromium
-        run: npx playwright install chromium
+      # ここを修正：3エンジンをまとめて入れる（依存パッケージも同時に）
+      - name: Install Playwright browsers (chromium, webkit, firefox)
+        run: npx playwright install --with-deps chromium webkit firefox
 
-      # ← 追加した診断ステップ（Secretsが読めているかをログ出力）
+      # 診断（Secrets確認）
       - name: Quick diag (check secrets)
         run: |
           node -e "const j=JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON); console.log('client_email=', j.client_email)"
