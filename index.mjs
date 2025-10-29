@@ -1,14 +1,14 @@
-import { chromium } from "playwright";
+import { chromium, webkit, firefox } from "playwright";
 import { google } from "googleapis";
 
 // ====== 設定 ======
-const SHEET_ID = process.env.SHEET_ID;     // GitHub Secret
+const SHEET_ID = process.env.SHEET_ID;
 const CONFIG_SHEET = "Config";
 const VIEWS_SHEET  = "Views";
 const DEBUG_SHEET  = "Debug";
 const TAIPEI_TZ = "Asia/Taipei";
 
-// ====== 共通関数 ======
+// ====== 共通 ======
 function todayInTaipei() {
   const now = new Date();
   const taipei = new Date(now.toLocaleString("en-US", { timeZone: TAIPEI_TZ }));
@@ -17,7 +17,6 @@ function todayInTaipei() {
   const d = String(taipei.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
 }
-
 function normalizeCount(v) {
   if (typeof v === "number") return v;
   if (typeof v === "string") {
@@ -28,306 +27,238 @@ function normalizeCount(v) {
   }
   return null;
 }
+function colLetter(n){let s="";while(n>0){const m=(n-1)%26;s=String.fromCharCode(65+m)+s;n=Math.floor((n-1)/26);}return s;}
 
-function columnLetter(n) {
-  let s = "";
-  while (n > 0) {
-    const m = (n - 1) % 26;
-    s = String.fromCharCode(65 + m) + s;
-    n = Math.floor((n - 1) / 26);
-  }
-  return s;
-}
-
-// ====== Google Sheets ======
-async function getSheets() {
+// ====== Sheets ======
+async function sheetsClient() {
   const creds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
   const jwt = new google.auth.JWT(
-    creds.client_email,
-    null,
-    creds.private_key,
+    creds.client_email, null, creds.private_key,
     ["https://www.googleapis.com/auth/spreadsheets"]
   );
   await jwt.authorize();
   return google.sheets({ version: "v4", auth: jwt });
 }
-
-async function ensureSheetExists(sheets, title) {
+async function ensureSheet(sheets, title){
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
-  const exists = meta.data.sheets?.some(s => s.properties?.title === title);
-  if (!exists) {
+  const ok = meta.data.sheets?.some(s => s.properties?.title === title);
+  if (!ok){
     await sheets.spreadsheets.batchUpdate({
       spreadsheetId: SHEET_ID,
       requestBody: { requests: [{ addSheet: { properties: { title } } }] }
     });
   }
 }
-
-async function readConfigUrls(sheets) {
-  await ensureSheetExists(sheets, CONFIG_SHEET);
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${CONFIG_SHEET}!A2:A`,
-    valueRenderOption: "UNFORMATTED_VALUE"
+async function readUrls(sheets){
+  await ensureSheet(sheets, CONFIG_SHEET);
+  const r = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: `${CONFIG_SHEET}!A2:A`
   });
-  const rows = res.data.values || [];
-  return rows.map(r => (r[0] || "").toString().trim()).filter(Boolean);
+  const rows = r.data.values || [];
+  return rows.map(x => (x[0]||"").toString().trim()).filter(Boolean);
 }
-
-async function ensureViewsHeader(sheets, dateStr) {
-  await ensureSheetExists(sheets, VIEWS_SHEET);
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${VIEWS_SHEET}!1:1`
+async function ensureHeader(sheets, dateStr){
+  await ensureSheet(sheets, VIEWS_SHEET);
+  const r = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: `${VIEWS_SHEET}!1:1`
   });
-  let header = (res.data.values && res.data.values[0]) || [];
-  if (header.length === 0) header = ["URL"];
-  let colIndex = header.indexOf(dateStr);
-  if (colIndex === -1) {
+  let header = (r.data.values && r.data.values[0]) || [];
+  if (!header.length) header = ["URL"];
+  let idx = header.indexOf(dateStr);
+  if (idx === -1){
     header.push(dateStr);
     await sheets.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID,
-      range: `${VIEWS_SHEET}!1:1`,
-      valueInputOption: "RAW",
-      requestBody: { values: [header] }
+      spreadsheetId: SHEET_ID, range: `${VIEWS_SHEET}!1:1`,
+      valueInputOption: "RAW", requestBody: { values: [header] }
     });
-    colIndex = header.length - 1;
+    idx = header.length - 1;
   }
-  return { header, colIndex };
+  return idx;
 }
-
-async function readAllRows(sheets) {
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${VIEWS_SHEET}!A2:Z100000`
+async function readRows(sheets){
+  const r = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: `${VIEWS_SHEET}!A2:Z100000`
   });
-  return res.data.values || [];
+  return r.data.values || [];
 }
-
-async function upsertViews(sheets, rowsResult, dateColIndex, existingRows) {
-  const map = new Map(); // URL -> rowNumber
-  existingRows.forEach((r, i) => {
-    const url = (r[0] || "").toString().trim();
-    if (url) map.set(url, i + 2);
-  });
-
-  const updates = [];
-  const appends = [];
-  const sheetCol = dateColIndex + 1;
-
-  rowsResult.forEach(({ url, value }) => {
-    const rowNum = map.get(url);
-    if (rowNum) {
-      const range = `${VIEWS_SHEET}!${columnLetter(sheetCol)}${rowNum}:${columnLetter(sheetCol)}${rowNum}`;
+async function upsert(sheets, results, dateColIndex, existing){
+  const map = new Map();
+  existing.forEach((r,i)=>{ const u=(r[0]||"").toString().trim(); if(u) map.set(u, i+2); });
+  const updates=[], appends=[]; const C = dateColIndex+1;
+  for (const {url, value} of results){
+    const row = map.get(url);
+    if (row){
+      const range = `${VIEWS_SHEET}!${colLetter(C)}${row}:${colLetter(C)}${row}`;
       updates.push({ range, values: [[value]] });
     } else {
-      const row = [];
-      row[0] = url;
-      for (let i = 1; i < sheetCol - 1; i++) row[i] = "";
-      row[sheetCol - 1] = value;
-      appends.push(row);
+      const arr = []; arr[0]=url; for(let i=1;i<C-1;i++) arr[i]=""; arr[C-1]=value;
+      appends.push(arr);
     }
-  });
-
-  if (updates.length) {
+  }
+  if (updates.length){
     await sheets.spreadsheets.values.batchUpdate({
-      spreadsheetId: SHEET_ID,
-      requestBody: { valueInputOption: "RAW", data: updates }
+      spreadsheetId: SHEET_ID, requestBody: { valueInputOption:"RAW", data: updates }
     });
   }
-  if (appends.length) {
+  if (appends.length){
     await sheets.spreadsheets.values.append({
-      spreadsheetId: SHEET_ID,
-      range: `${VIEWS_SHEET}!A:A`,
-      valueInputOption: "RAW",
-      insertDataOption: "INSERT_ROWS",
+      spreadsheetId: SHEET_ID, range: `${VIEWS_SHEET}!A:A`,
+      valueInputOption:"RAW", insertDataOption:"INSERT_ROWS",
       requestBody: { values: appends }
     });
   }
 }
-
-// Debugシート： [ISO時刻, URL, 状態/理由]
-async function appendDebug(sheets, items) {
-  await ensureSheetExists(sheets, DEBUG_SHEET);
-  if (!items.length) return;
+async function appendDebug(sheets, rows){
+  await ensureSheet(sheets, DEBUG_SHEET);
+  if (!rows.length) return;
   await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID,
-    range: `${DEBUG_SHEET}!A:A`,
-    valueInputOption: "RAW",
-    insertDataOption: "INSERT_ROWS",
-    requestBody: {
-      values: items.map(x => [new Date().toISOString(), x.url, x.reason])
-    }
+    spreadsheetId: SHEET_ID, range: `${DEBUG_SHEET}!A:A`,
+    valueInputOption:"RAW", insertDataOption:"INSERT_ROWS",
+    requestBody: { values: rows.map(x=>[new Date().toISOString(), x.url, x.engine, x.status||"", x.htmlLen||"", x.reason]) }
   });
 }
 
 // ====== TikTok 取得 ======
-async function fetchPlayCount(page, url) {
-  const result = { count: null, reason: "" };
+async function tryOneEngine(engineName, browserType, url){
+  const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
+  const browser = await browserType.launch({ headless: true, args: ['--disable-blink-features=AutomationControlled'] });
+  const context = await browser.newContext({
+    locale: 'en-US',
+    userAgent: ua,
+    viewport: { width: 1366, height: 900 },
+    timezoneId: TAIPEI_TZ,
+    extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9,ja;q=0.8' }
+  });
+  const page = await context.newPage();
+  let status = 0, htmlLen = 0, reason = "";
 
-  // URL 正規化（m. → www.、lang=en 付与）
+  // 正規化
   let target = url.replace("m.tiktok.com/", "www.tiktok.com/");
   target += (target.includes("?") ? "&" : "?") + "lang=en";
 
   try {
-    const resp = await page.goto(target, {
-      waitUntil: "networkidle",
-      timeout: 60000
-    });
+    const resp = await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60000 });
+    status = resp?.status() || 0;
 
-    // 403/404など
-    const status = resp?.status();
-    if (status && status >= 400) {
-      result.reason = `HTTP ${status}`;
-      return result;
-    }
-
-    // Cookie同意を片付け（パターン複数）
-    const consentSelectors = [
+    // Cookie同意押し
+    const selectors = [
       'button:has-text("Accept all")',
       'button:has-text("I agree")',
       'button:has-text("同意する")',
-      'button:has-text("同意")',
-      '[data-e2e="cookie-banner-accept-button"]',
+      '[data-e2e="cookie-banner-accept-button"]'
     ];
-    for (const sel of consentSelectors) {
-      const btn = await page.$(sel).catch(() => null);
-      if (btn) { await btn.click().catch(() => {}); break; }
-    }
+    for (const s of selectors){ const b = await page.$(s).catch(()=>null); if (b){ await b.click().catch(()=>{}); break; } }
 
-    // まず SIGI_STATE を待つ → 無ければ __NEXT_DATA__ を待つ
-    const hasSigi = await page.$('#SIGI_STATE');
-    if (!hasSigi) {
-      await page.waitForTimeout(1500);
-    }
+    await page.waitForTimeout(1500);
+    await page.mouse.wheel(0, 1200);
+    await page.waitForTimeout(800);
 
-    // 取得ロジック
+    // JSON取得
     const data = await page.evaluate(() => {
-      const sigi = document.querySelector('#SIGI_STATE');
-      if (sigi) {
-        try { return { type: 'SIGI_STATE', json: JSON.parse(sigi.textContent) }; } catch (_e) {}
-      }
-      const next = document.querySelector('#__NEXT_DATA__');
-      if (next) {
-        try { return { type: '__NEXT_DATA__', json: JSON.parse(next.textContent) }; } catch (_e) {}
-      }
-      return null;
+      const pick = (id)=>{ const el=document.querySelector(id); if(!el) return null; try{ return JSON.parse(el.textContent);}catch(_){return null;} };
+      return { sigi: pick('#SIGI_STATE'), next: pick('#__NEXT_DATA__') };
     });
 
-    if (!data || !data.json) {
-      result.reason = 'no SIGI_STATE / __NEXT_DATA__';
-      return result;
+    if (!data.sigi && !data.next){
+      const html = await page.content(); htmlLen = html.length;
+      reason = "no SIGI_STATE / __NEXT_DATA__";
+      return { ok:false, engine: engineName, status, htmlLen, reason };
     }
 
-    // JSONからplayCountを抽出
-    const json = data.json;
-    const idMatch = target.split('/').filter(Boolean).pop()?.replace(/\?.*$/, "");
+    const json = data.sigi || data.next;
+    // 直接 ItemModule → playCount
+    const id = target.split('/').filter(Boolean).pop()?.replace(/\?.*$/,"");
     let play = null;
-
-    if (json.ItemModule) {
-      const k = (/^\d+$/.test(idMatch) && json.ItemModule[idMatch]) ? idMatch : Object.keys(json.ItemModule)[0];
+    if (json?.ItemModule){
+      const k = (/^\d+$/.test(id) && json.ItemModule[id]) ? id : Object.keys(json.ItemModule)[0];
       play = json.ItemModule[k]?.stats?.playCount ?? null;
     }
-
-    // さらにフォールバック（deep search）
-    if (play == null) {
-      const stack = [json];
-      while (stack.length) {
-        const cur = stack.pop();
+    if (play==null){
+      // 深掘り
+      const stack=[json];
+      while(stack.length){
+        const cur=stack.pop();
         if (!cur) continue;
-        if (typeof cur === 'object') {
-          for (const key of Object.keys(cur)) {
-            if (/^play[_]?count(v2)?$/i.test(key)) {
-              const v = cur[key];
-              const n = normalizeCount(v);
-              if (n != null) { play = n; break; }
+        if (Array.isArray(cur)) { cur.forEach(x=>stack.push(x)); continue; }
+        if (typeof cur==='object'){
+          for (const key of Object.keys(cur)){
+            if (/^play[_]?count(v2)?$/i.test(key)){
+              const n = normalizeCount(cur[key]);
+              if (n!=null){ play=n; break; }
             }
-            const val = cur[key];
-            if (val && typeof val === 'object') stack.push(val);
+            const v=cur[key]; if (v && typeof v==='object') stack.push(v);
           }
-        } else if (Array.isArray(cur)) {
-          cur.forEach(x => stack.push(x));
+          if (play!=null) break;
         }
-        if (play != null) break;
       }
     }
-
-    if (play == null) {
-      result.reason = 'playCount not found';
-      return result;
+    if (play==null){
+      reason = "playCount not found";
+      return { ok:false, engine: engineName, status, htmlLen: 0, reason };
     }
+    return { ok:true, engine: engineName, count: normalizeCount(play), status };
 
-    result.count = normalizeCount(play);
-    result.reason = 'OK';
-    return result;
-
-  } catch (e) {
-    result.reason = 'exception: ' + (e?.message || e);
-    return result;
+  } catch(e){
+    reason = "exception: " + (e?.message || e);
+    return { ok:false, engine: engineName, status, htmlLen, reason };
+  } finally {
+    await context.close(); await browser.close();
   }
 }
 
-// ====== メイン ======
+async function fetchPlayCountMulti(url){
+  // Chromium → WebKit → Firefox の順に挑戦
+  const engines = [
+    ["chromium", chromium],
+    ["webkit",   webkit],
+    ["firefox",  firefox],
+  ];
+  for (const [name, type] of engines){
+    const r = await tryOneEngine(name, type, url);
+    if (r.ok) return r;  // 成功
+    // 次のエンジンへ
+    if (name !== "firefox") await new Promise(r => setTimeout(r, 1200));
+  }
+  // すべて失敗
+  return { ok:false, engine:"all", status:0, htmlLen:0, reason:"all engines failed" };
+}
+
+// ====== Main ======
 (async () => {
   try {
-    const sheets = await getSheets();
-    const urls = await readConfigUrls(sheets);
-    if (urls.length === 0) {
-      console.log("ConfigにURLがありません。A2以降にURLを入れてください。");
-      process.exit(0);
-    }
+    const sheets = await sheetsClient();
+    const urls = await readUrls(sheets);
+    if (!urls.length){ console.log("Config!A2:A にURLを入れてください"); return; }
 
     const dateStr = todayInTaipei();
-    await ensureSheetExists(sheets, VIEWS_SHEET);
+    await ensureSheet(sheets, VIEWS_SHEET);
     await sheets.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID,
-      range: `${VIEWS_SHEET}!A1`,
-      valueInputOption: "RAW",
-      requestBody: { values: [["URL"]] }
+      spreadsheetId: SHEET_ID, range: `${VIEWS_SHEET}!A1`,
+      valueInputOption:"RAW", requestBody:{ values:[["URL"]] }
     });
-    const { colIndex } = await ensureViewsHeader(sheets, dateStr);
-    const existingRows = await readAllRows(sheets);
+    const colIndex = await ensureHeader(sheets, dateStr);
+    const existing = await readRows(sheets);
 
-    // ブラウザ起動（UA/言語を上書き）
-    const browser = await chromium.launch({
-      headless: true,
-      args: ['--disable-blink-features=AutomationControlled']
-    });
-    const context = await browser.newContext({
-      locale: 'en-US',
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      extraHTTPHeaders: {
-        'Accept-Language': 'en-US,en;q=0.9,ja;q=0.8'
-      },
-      viewport: { width: 1366, height: 900 },
-      timezoneId: TAIPEI_TZ
-    });
-    const page = await context.newPage();
-
-    const results = [];
-    const debugs = [];
-
-    for (const url of urls) {
-      const { count, reason } = await fetchPlayCount(page, url);
-      results.push({ url, value: count ?? 'ERROR' });
-      if (count == null) {
-        debugs.push({ url, reason }); // Debugシートに理由を残す
-        console.log(`❌ ${url} -> ${reason}`);
+    const results = [], debugs = [];
+    for (const u of urls){
+      const r = await fetchPlayCountMulti(u);
+      if (r.ok){
+        results.push({ url:u, value:r.count });
+        console.log(`✅ ${u} -> ${r.count} (${r.engine})`);
       } else {
-        console.log(`✅ ${url} -> ${count}`);
+        results.push({ url:u, value:"ERROR" });
+        debugs.push({ url:u, engine:r.engine, status:r.status, htmlLen:r.htmlLen, reason:r.reason });
+        console.log(`❌ ${u} -> ${r.reason} (${r.engine})`);
       }
-      await page.waitForTimeout(1200 + Math.floor(Math.random() * 800));
+      await new Promise(res=>setTimeout(res, 1200));
     }
 
-    await browser.close();
-
-    await upsertViews(sheets, results, colIndex, existingRows);
+    await upsert(sheets, results, colIndex, existing);
     if (debugs.length) await appendDebug(sheets, debugs);
-    console.log("✅ 更新完了:", dateStr);
+    console.log("✅ 完了:", dateStr);
 
-  } catch (e) {
-    console.error('FATAL:', e?.stack || e);
+  } catch(e){
+    console.error("FATAL:", e?.stack || e);
     process.exit(1);
   }
 })();
