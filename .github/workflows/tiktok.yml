@@ -1,0 +1,20 @@
+name: TikTok Daily to Google Sheets
+on:
+  schedule:
+    - cron: '0 23 * * *'   # UTC 23:00 = 台北 07:00
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm i
+      - run: npx playwright install chromium
+      - run: node index.mjs
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
