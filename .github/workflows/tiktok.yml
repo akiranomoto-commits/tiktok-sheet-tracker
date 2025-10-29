@@ -1,4 +1,5 @@
 name: TikTok Daily to Google Sheets
+
 on:
   schedule:
     - cron: '0 23 * * *'   # UTC 23:00 = 台北 07:00
@@ -7,14 +8,33 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm i
-      - run: npx playwright install chromium
-      - run: node index.mjs
+
+      - name: Install deps
+        run: npm i
+
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium
+
+      # ← 追加した診断ステップ（Secretsが読めているかをログ出力）
+      - name: Quick diag (check secrets)
+        run: |
+          node -e "const j=JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON); console.log('client_email=', j.client_email)"
+          echo "sheet_id=${SHEET_ID:+SET}${SHEET_ID:-MISSING}"
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
+      - name: Run tracker
+        run: node index.mjs
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
