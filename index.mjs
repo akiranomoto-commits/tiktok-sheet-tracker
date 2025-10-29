@@ -120,11 +120,16 @@ async function appendDebug(sheets, rows){
 
 // ====== TikTok 取得 ======
 async function tryOneEngine(engineName, browserType, url){
-  const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
-  const browser = await browserType.launch({ headless: true, args: ['--disable-blink-features=AutomationControlled'] });
+  // エンジンごとに適切な起動オプションに分岐（ChromiumだけAutomationControlledを無効化）
+  const launchArgs = [];
+  if (engineName === "chromium") {
+    launchArgs.push("--disable-blink-features=AutomationControlled");
+    launchArgs.push("--no-sandbox","--disable-dev-shm-usage");
+  }
+  const browser = await browserType.launch({ headless: true, args: launchArgs });
   const context = await browser.newContext({
     locale: 'en-US',
-    userAgent: ua,
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
     viewport: { width: 1366, height: 900 },
     timezoneId: TAIPEI_TZ,
     extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9,ja;q=0.8' }
@@ -140,7 +145,7 @@ async function tryOneEngine(engineName, browserType, url){
     const resp = await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60000 });
     status = resp?.status() || 0;
 
-    // Cookie同意押し
+    // Cookie同意押し（いくつかのラベルに対応）
     const selectors = [
       'button:has-text("Accept all")',
       'button:has-text("I agree")',
@@ -149,14 +154,15 @@ async function tryOneEngine(engineName, browserType, url){
     ];
     for (const s of selectors){ const b = await page.$(s).catch(()=>null); if (b){ await b.click().catch(()=>{}); break; } }
 
+    // 少し待ってスクロール
     await page.waitForTimeout(1500);
     await page.mouse.wheel(0, 1200);
     await page.waitForTimeout(800);
 
     // JSON取得
     const data = await page.evaluate(() => {
-      const pick = (id)=>{ const el=document.querySelector(id); if(!el) return null; try{ return JSON.parse(el.textContent);}catch(_){return null;} };
-      return { sigi: pick('#SIGI_STATE'), next: pick('#__NEXT_DATA__') };
+      const parse = (id)=>{ const el=document.querySelector(id); if(!el) return null; try{ return JSON.parse(el.textContent);}catch(_){return null;} };
+      return { sigi: parse('#SIGI_STATE'), next: parse('#__NEXT_DATA__') };
     });
 
     if (!data.sigi && !data.next){
@@ -166,7 +172,6 @@ async function tryOneEngine(engineName, browserType, url){
     }
 
     const json = data.sigi || data.next;
-    // 直接 ItemModule → playCount
     const id = target.split('/').filter(Boolean).pop()?.replace(/\?.*$/,"");
     let play = null;
     if (json?.ItemModule){
@@ -174,7 +179,6 @@ async function tryOneEngine(engineName, browserType, url){
       play = json.ItemModule[k]?.stats?.playCount ?? null;
     }
     if (play==null){
-      // 深掘り
       const stack=[json];
       while(stack.length){
         const cur=stack.pop();
@@ -207,7 +211,6 @@ async function tryOneEngine(engineName, browserType, url){
 }
 
 async function fetchPlayCountMulti(url){
-  // Chromium → WebKit → Firefox の順に挑戦
   const engines = [
     ["chromium", chromium],
     ["webkit",   webkit],
@@ -215,11 +218,9 @@ async function fetchPlayCountMulti(url){
   ];
   for (const [name, type] of engines){
     const r = await tryOneEngine(name, type, url);
-    if (r.ok) return r;  // 成功
-    // 次のエンジンへ
+    if (r.ok) return r;
     if (name !== "firefox") await new Promise(r => setTimeout(r, 1200));
   }
-  // すべて失敗
   return { ok:false, engine:"all", status:0, htmlLen:0, reason:"all engines failed" };
 }
 
