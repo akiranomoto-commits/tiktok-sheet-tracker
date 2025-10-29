@@ -1,0 +1,10 @@
+{
+  "type": "module",
+  "dependencies": {
+    "googleapis": "^133.0.0",
+    "playwright": "^1.47.0"
+  },
+  "scripts": {
+    "start": "node index.mjs"
+  }
+}
