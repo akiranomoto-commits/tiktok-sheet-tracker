@@ -2,12 +2,13 @@ import { chromium } from "playwright";
 import { google } from "googleapis";
 
 // ====== 設定 ======
-const SHEET_ID = process.env.SHEET_ID;     // GitHub Secret で渡す
+const SHEET_ID = process.env.SHEET_ID;     // GitHub Secret
 const CONFIG_SHEET = "Config";
 const VIEWS_SHEET  = "Views";
+const DEBUG_SHEET  = "Debug";
 const TAIPEI_TZ = "Asia/Taipei";
 
-// ====== 日付（YYYY-MM-DD, Asia/Taipei） ======
+// ====== 共通関数 ======
 function todayInTaipei() {
   const now = new Date();
   const taipei = new Date(now.toLocaleString("en-US", { timeZone: TAIPEI_TZ }));
@@ -17,7 +18,6 @@ function todayInTaipei() {
   return `${y}-${m}-${d}`;
 }
 
-// K/Mや"12,345"を数値化
 function normalizeCount(v) {
   if (typeof v === "number") return v;
   if (typeof v === "string") {
@@ -29,25 +29,17 @@ function normalizeCount(v) {
   return null;
 }
 
-// TikTokの再生数を取得（実ブラウザ）
-async function fetchPlayCount(page, url) {
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-  const data = await page.evaluate(() => {
-    const el = document.querySelector("#SIGI_STATE");
-    return el ? JSON.parse(el.textContent) : null;
-  });
-
-  let playCount = null;
-  if (data?.ItemModule) {
-    const idMatch = url.split("/").filter(Boolean).pop()?.replace(/\?.*$/, "");
-    const keys = Object.keys(data.ItemModule);
-    const key = /^\d+$/.test(idMatch) && data.ItemModule[idMatch] ? idMatch : (keys[0] || null);
-    if (key) playCount = data.ItemModule[key]?.stats?.playCount ?? null;
+function columnLetter(n) {
+  let s = "";
+  while (n > 0) {
+    const m = (n - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    n = Math.floor((n - 1) / 26);
   }
-  return normalizeCount(playCount);
+  return s;
 }
 
-// Google Sheets クライアント
+// ====== Google Sheets ======
 async function getSheets() {
   const creds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
   const jwt = new google.auth.JWT(
@@ -60,8 +52,19 @@ async function getSheets() {
   return google.sheets({ version: "v4", auth: jwt });
 }
 
+async function ensureSheetExists(sheets, title) {
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
+  const exists = meta.data.sheets?.some(s => s.properties?.title === title);
+  if (!exists) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody: { requests: [{ addSheet: { properties: { title } } }] }
+    });
+  }
+}
+
 async function readConfigUrls(sheets) {
-  // Config!A2:A を取得
+  await ensureSheetExists(sheets, CONFIG_SHEET);
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
     range: `${CONFIG_SHEET}!A2:A`,
@@ -72,15 +75,13 @@ async function readConfigUrls(sheets) {
 }
 
 async function ensureViewsHeader(sheets, dateStr) {
-  // 1行目のヘッダを読み込み
+  await ensureSheetExists(sheets, VIEWS_SHEET);
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
     range: `${VIEWS_SHEET}!1:1`
   });
   let header = (res.data.values && res.data.values[0]) || [];
-  if (header.length === 0) header = ["URL"]; // 初期化
-
-  // 日付列がなければ追加
+  if (header.length === 0) header = ["URL"];
   let colIndex = header.indexOf(dateStr);
   if (colIndex === -1) {
     header.push(dateStr);
@@ -92,62 +93,48 @@ async function ensureViewsHeader(sheets, dateStr) {
     });
     colIndex = header.length - 1;
   }
-  return { header, colIndex }; // colIndex は0始まり（A=0, B=1, …）
+  return { header, colIndex };
 }
 
 async function readAllRows(sheets) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    range: `${VIEWS_SHEET}!A2:Z100000` // 十分大きく
+    range: `${VIEWS_SHEET}!A2:Z100000`
   });
-  const values = res.data.values || [];
-  return values; // 2行目以降
+  return res.data.values || [];
 }
 
-async function upsertViews(sheets, urls, dateColIndex, rows) {
-  // rows: 2行目以降の配列（先頭列がURL）
-  const existingMap = new Map(); // URL -> 行番号（シート上の実際の行番号）
-  rows.forEach((r, i) => {
+async function upsertViews(sheets, rowsResult, dateColIndex, existingRows) {
+  const map = new Map(); // URL -> rowNumber
+  existingRows.forEach((r, i) => {
     const url = (r[0] || "").toString().trim();
-    if (url) existingMap.set(url, i + 2); // +2: 1行目がヘッダ、配列は0始まり
+    if (url) map.set(url, i + 2);
   });
 
-  // まず既存URLの行を更新、無いURLは新規行を追加
   const updates = [];
   const appends = [];
-
-  // dateColIndex は0始まり。シートの列番号（A=1…）に直す
   const sheetCol = dateColIndex + 1;
 
-  for (const { url, view } of urls) {
-    const rowNum = existingMap.get(url);
+  rowsResult.forEach(({ url, value }) => {
+    const rowNum = map.get(url);
     if (rowNum) {
-      // 既存行の該当日付列だけ更新
       const range = `${VIEWS_SHEET}!${columnLetter(sheetCol)}${rowNum}:${columnLetter(sheetCol)}${rowNum}`;
-      updates.push({ range, values: [[view]] });
+      updates.push({ range, values: [[value]] });
     } else {
-      // 新規行：URLをA列、日付列にview、それより左の空白を埋める
       const row = [];
-      // A列 = URL
       row[0] = url;
-      // 日付列位置に view を入れる（足りない分は空白を埋める）
       for (let i = 1; i < sheetCol - 1; i++) row[i] = "";
-      row[sheetCol - 1] = view;
+      row[sheetCol - 1] = value;
       appends.push(row);
     }
-  }
+  });
 
-  // バッチ更新
   if (updates.length) {
     await sheets.spreadsheets.values.batchUpdate({
       spreadsheetId: SHEET_ID,
-      requestBody: {
-        valueInputOption: "RAW",
-        data: updates
-      }
+      requestBody: { valueInputOption: "RAW", data: updates }
     });
   }
-
   if (appends.length) {
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
@@ -159,51 +146,188 @@ async function upsertViews(sheets, urls, dateColIndex, rows) {
   }
 }
 
-function columnLetter(n) {
-  // 1 -> A, 2 -> B ...
-  let s = "";
-  while (n > 0) {
-    const m = (n - 1) % 26;
-    s = String.fromCharCode(65 + m) + s;
-    n = Math.floor((n - 1) / 26);
-  }
-  return s;
+// Debugシート： [ISO時刻, URL, 状態/理由]
+async function appendDebug(sheets, items) {
+  await ensureSheetExists(sheets, DEBUG_SHEET);
+  if (!items.length) return;
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: `${DEBUG_SHEET}!A:A`,
+    valueInputOption: "RAW",
+    insertDataOption: "INSERT_ROWS",
+    requestBody: {
+      values: items.map(x => [new Date().toISOString(), x.url, x.reason])
+    }
+  });
 }
 
-(async () => {
-  const sheets = await getSheets();
-  const urls = await readConfigUrls(sheets);
-  if (urls.length === 0) {
-    console.log("ConfigにURLがありません。A2以降にURLを入れてください。");
-    process.exit(0);
-  }
+// ====== TikTok 取得 ======
+async function fetchPlayCount(page, url) {
+  const result = { count: null, reason: "" };
 
-  const dateStr = todayInTaipei();
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range: `${VIEWS_SHEET}!A1`,
-    valueInputOption: "RAW",
-    requestBody: { values: [["URL"]] }
-  });
-  const { colIndex } = await ensureViewsHeader(sheets, dateStr);
-  const existingRows = await readAllRows(sheets);
+  // URL 正規化（m. → www.、lang=en 付与）
+  let target = url.replace("m.tiktok.com/", "www.tiktok.com/");
+  target += (target.includes("?") ? "&" : "?") + "lang=en";
 
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
+  try {
+    const resp = await page.goto(target, {
+      waitUntil: "networkidle",
+      timeout: 60000
+    });
 
-  const results = [];
-  for (const url of urls) {
-    try {
-      const view = await fetchPlayCount(page, url);
-      results.push({ url, view: view ?? "ERROR" });
-      await new Promise(r => setTimeout(r, 1500));
-    } catch (e) {
-      results.push({ url, view: "ERROR" });
+    // 403/404など
+    const status = resp?.status();
+    if (status && status >= 400) {
+      result.reason = `HTTP ${status}`;
+      return result;
     }
+
+    // Cookie同意を片付け（パターン複数）
+    const consentSelectors = [
+      'button:has-text("Accept all")',
+      'button:has-text("I agree")',
+      'button:has-text("同意する")',
+      'button:has-text("同意")',
+      '[data-e2e="cookie-banner-accept-button"]',
+    ];
+    for (const sel of consentSelectors) {
+      const btn = await page.$(sel).catch(() => null);
+      if (btn) { await btn.click().catch(() => {}); break; }
+    }
+
+    // まず SIGI_STATE を待つ → 無ければ __NEXT_DATA__ を待つ
+    const hasSigi = await page.$('#SIGI_STATE');
+    if (!hasSigi) {
+      await page.waitForTimeout(1500);
+    }
+
+    // 取得ロジック
+    const data = await page.evaluate(() => {
+      const sigi = document.querySelector('#SIGI_STATE');
+      if (sigi) {
+        try { return { type: 'SIGI_STATE', json: JSON.parse(sigi.textContent) }; } catch (_e) {}
+      }
+      const next = document.querySelector('#__NEXT_DATA__');
+      if (next) {
+        try { return { type: '__NEXT_DATA__', json: JSON.parse(next.textContent) }; } catch (_e) {}
+      }
+      return null;
+    });
+
+    if (!data || !data.json) {
+      result.reason = 'no SIGI_STATE / __NEXT_DATA__';
+      return result;
+    }
+
+    // JSONからplayCountを抽出
+    const json = data.json;
+    const idMatch = target.split('/').filter(Boolean).pop()?.replace(/\?.*$/, "");
+    let play = null;
+
+    if (json.ItemModule) {
+      const k = (/^\d+$/.test(idMatch) && json.ItemModule[idMatch]) ? idMatch : Object.keys(json.ItemModule)[0];
+      play = json.ItemModule[k]?.stats?.playCount ?? null;
+    }
+
+    // さらにフォールバック（deep search）
+    if (play == null) {
+      const stack = [json];
+      while (stack.length) {
+        const cur = stack.pop();
+        if (!cur) continue;
+        if (typeof cur === 'object') {
+          for (const key of Object.keys(cur)) {
+            if (/^play[_]?count(v2)?$/i.test(key)) {
+              const v = cur[key];
+              const n = normalizeCount(v);
+              if (n != null) { play = n; break; }
+            }
+            const val = cur[key];
+            if (val && typeof val === 'object') stack.push(val);
+          }
+        } else if (Array.isArray(cur)) {
+          cur.forEach(x => stack.push(x));
+        }
+        if (play != null) break;
+      }
+    }
+
+    if (play == null) {
+      result.reason = 'playCount not found';
+      return result;
+    }
+
+    result.count = normalizeCount(play);
+    result.reason = 'OK';
+    return result;
+
+  } catch (e) {
+    result.reason = 'exception: ' + (e?.message || e);
+    return result;
   }
+}
 
-  await browser.close();
+// ====== メイン ======
+(async () => {
+  try {
+    const sheets = await getSheets();
+    const urls = await readConfigUrls(sheets);
+    if (urls.length === 0) {
+      console.log("ConfigにURLがありません。A2以降にURLを入れてください。");
+      process.exit(0);
+    }
 
-  await upsertViews(sheets, results, colIndex, existingRows);
-  console.log("✅ 更新完了:", dateStr);
+    const dateStr = todayInTaipei();
+    await ensureSheetExists(sheets, VIEWS_SHEET);
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID,
+      range: `${VIEWS_SHEET}!A1`,
+      valueInputOption: "RAW",
+      requestBody: { values: [["URL"]] }
+    });
+    const { colIndex } = await ensureViewsHeader(sheets, dateStr);
+    const existingRows = await readAllRows(sheets);
+
+    // ブラウザ起動（UA/言語を上書き）
+    const browser = await chromium.launch({
+      headless: true,
+      args: ['--disable-blink-features=AutomationControlled']
+    });
+    const context = await browser.newContext({
+      locale: 'en-US',
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      extraHTTPHeaders: {
+        'Accept-Language': 'en-US,en;q=0.9,ja;q=0.8'
+      },
+      viewport: { width: 1366, height: 900 },
+      timezoneId: TAIPEI_TZ
+    });
+    const page = await context.newPage();
+
+    const results = [];
+    const debugs = [];
+
+    for (const url of urls) {
+      const { count, reason } = await fetchPlayCount(page, url);
+      results.push({ url, value: count ?? 'ERROR' });
+      if (count == null) {
+        debugs.push({ url, reason }); // Debugシートに理由を残す
+        console.log(`❌ ${url} -> ${reason}`);
+      } else {
+        console.log(`✅ ${url} -> ${count}`);
+      }
+      await page.waitForTimeout(1200 + Math.floor(Math.random() * 800));
+    }
+
+    await browser.close();
+
+    await upsertViews(sheets, results, colIndex, existingRows);
+    if (debugs.length) await appendDebug(sheets, debugs);
+    console.log("✅ 更新完了:", dateStr);
+
+  } catch (e) {
+    console.error('FATAL:', e?.stack || e);
+    process.exit(1);
+  }
 })();
